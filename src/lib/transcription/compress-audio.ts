@@ -1,12 +1,16 @@
 import { spawn } from "node:child_process";
 
 const DEFAULT_MAX_BYTES = 24 * 1024 * 1024;
-const DEFAULT_BITRATE_KBPS = 16;
+const DEFAULT_BITRATE_KBPS = 12;
+const MIN_BITRATE_KBPS = 6;
+const WHISPER_HARD_LIMIT_BYTES = 25 * 1024 * 1024;
 
 export interface CompressResult {
     buffer: Buffer;
     contentType: string;
     compressed: boolean;
+    /** Final Opus bitrate the encode landed on, in kbit/s. Undefined when not compressed. */
+    finalBitrateKbps?: number;
 }
 
 export interface CompressOptions {
@@ -23,8 +27,11 @@ export interface CompressOptions {
  * no re-encode is needed; otherwise a fresh Ogg/Opus buffer with
  * `contentType: "audio/ogg"`.
  *
- * At 16 kbit/s mono Opus, one 25 MiB request fits ~3.5 h of speech, which
- * covers the long-meeting use case the upstream code does not handle.
+ * The starting bitrate (default 12 kbit/s) sizes the common case. For very
+ * long recordings the first encode may still exceed the 25 MiB hard cap;
+ * in that case the bitrate is halved and the encode retried, down to a
+ * 6 kbit/s floor. 6 kbit/s mono Opus fits ~8 h of speech in one request
+ * with quality still adequate for Whisper.
  */
 export async function maybeCompressForWhisper(
     audioBuffer: Buffer,
@@ -32,15 +39,49 @@ export async function maybeCompressForWhisper(
     opts: CompressOptions = {},
 ): Promise<CompressResult> {
     const maxBytes = opts.maxBytes ?? envMaxBytes() ?? DEFAULT_MAX_BYTES;
-    const bitrateKbps =
+    const startBitrate =
         opts.bitrateKbps ?? envBitrateKbps() ?? DEFAULT_BITRATE_KBPS;
 
     if (audioBuffer.length <= maxBytes) {
         return { buffer: audioBuffer, contentType, compressed: false };
     }
 
-    const compressed = await ffmpegToOpus(audioBuffer, bitrateKbps);
-    return { buffer: compressed, contentType: "audio/ogg", compressed: true };
+    let bitrate = startBitrate;
+    let output = await ffmpegToOpus(audioBuffer, bitrate);
+
+    while (
+        output.length > WHISPER_HARD_LIMIT_BYTES &&
+        bitrate > MIN_BITRATE_KBPS
+    ) {
+        const nextBitrate = Math.max(MIN_BITRATE_KBPS, Math.floor(bitrate / 2));
+        console.warn(
+            `[whisper-compress] ${formatMib(output.length)} at ${bitrate} kbit/s still exceeds 25 MiB; retrying at ${nextBitrate} kbit/s`,
+        );
+        bitrate = nextBitrate;
+        output = await ffmpegToOpus(audioBuffer, bitrate);
+    }
+
+    if (output.length > WHISPER_HARD_LIMIT_BYTES) {
+        throw new Error(
+            `Audio still exceeds Whisper's 25 MiB limit at the minimum bitrate (${MIN_BITRATE_KBPS} kbit/s, output ${formatMib(output.length)}). ` +
+                "Recording is too long for single-request transcription; chunking is required.",
+        );
+    }
+
+    console.info(
+        `[whisper-compress] re-encoded ${formatMib(audioBuffer.length)} → ${formatMib(output.length)} at ${bitrate} kbit/s mono Opus`,
+    );
+
+    return {
+        buffer: output,
+        contentType: "audio/ogg",
+        compressed: true,
+        finalBitrateKbps: bitrate,
+    };
+}
+
+function formatMib(bytes: number): string {
+    return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
 }
 
 function envMaxBytes(): number | undefined {
